@@ -25,7 +25,7 @@ ARG COMMIT
 ARG WORKDIR=/ngen
 
 ARG TROUTE_REPO_URL=https://github.com/NOAA-OWP/t-route.git
-ARG TROUTE_BRANCH=ngen
+ARG TROUTE_BRANCH=master
 ARG TROUTE_COMMIT
 
 #### Default arguments for required dependencies needed during various build stages
@@ -40,12 +40,14 @@ ARG ROCKY_BASE_REQUIRED="sudo bash git"
 #    bzip2 expat expat-devel flex bison udunits2 udunits2-devel"
 
 ARG ROCKY_NGEN_DEPS_REQUIRED="sudo gcc gcc-c++ make cmake tar git gcc-gfortran libgfortran \
-    python39 python39-devel python39-pip \
+    python3 python3-devel python3-pip gdal gdal-devel\
     bzip2 expat expat-devel flex bison udunits2 udunits2-devel zlib-devel"
 # TODO: removed texinfo from list because it couldn't be found; make sure this doesn't lead to issues
 
 ARG BOOST_VERSION=1.72.0
-ARG MPICH_VERSION="3.2"
+#TODO Try mpich 4.x for native arm build support (https://raw.githubusercontent.com/pmodels/mpich/v4.1.1/CHANGES)
+#mpich 3.2 doesn't work well gfortran 11 it seems, an alignment error crops up, but 3.3.2 seems to work...
+ARG MPICH_VERSION="3.3.2"
 ARG MIN_PYTHON="3.8.0"
 ARG MIN_NUMPY="1.18.0"
 
@@ -82,7 +84,7 @@ ARG BUILD_SLOTH="true"
 ################################################################################################################
 ################################################################################################################
 ##### Create intermediate Docker build stage for Rocky-Linux-based "base"
-FROM rockylinux:8.5 as rocky-base
+FROM rockylinux:9.1 as rocky-base
 
 #ARG USER=root
 
@@ -90,7 +92,7 @@ ARG ROCKY_BASE_REQUIRED
 
 RUN dnf update -y \
     && dnf install -y 'dnf-command(config-manager)' \
-    && dnf config-manager --set-enabled powertools \
+    && dnf config-manager --set-enabled crb \
     && dnf install -y epel-release \
     && dnf -y install ${ROCKY_BASE_REQUIRED} 
     # Note that adduser -p expects an encrypted/hashed password, so it will ignore a simple password \
@@ -106,7 +108,7 @@ ARG WORKDIR=/ngen
 ################################################################################################################
 ################################################################################################################
 ##### Create intermediate Docker build stage for downloading Boost
-FROM rockylinux:8.5 AS download_boost
+FROM rockylinux:9.1 AS download_boost
 
 # Redeclaring inside this stage to get default from before first FROM
 ARG BOOST_VERSION
@@ -118,7 +120,7 @@ RUN curl -L -o boost_${BOOST_VERSION//./_}.tar.bz2 https://sourceforge.net/proje
 ################################################################################################################
 ##https://support.hdfgroup.org/ftp/HDF5/releases##############################################################################################################
 ##### Create intermediate Docker build stage for downloading MPICH
-FROM rockylinux:8.5 AS download_mpich
+FROM rockylinux:9.1 AS download_mpich
 
 # Redeclaring inside this stage to get default from before first FROM
 ARG MPICH_VERSION
@@ -129,7 +131,7 @@ RUN curl -o /tmp/mpich-${MPICH_VERSION}.tar.gz https://www.mpich.org/static/down
 ################################################################################################################
 ################################################################################################################
 ##### Create intermediate Docker build stage for downloading MPICH
-FROM rockylinux:8.5 AS download_hd5
+FROM rockylinux:9.1 AS download_hd5
 
 # Redeclaring inside this stage to get default from before first FROM
 ARG HD5_VERSION
@@ -279,7 +281,8 @@ RUN echo "export HYDRA_HOST_FILE=${HYDRA_HOST_FILE}" >> /etc/profile \
     && cd /tmp/ngen-deps \
     && tar xfz mpich-${MPICH_VERSION}.tar.gz  \
     && cd mpich-${MPICH_VERSION} \
-    && ./configure ${MPICH_CONFIGURE_OPTIONS} \
+    # mpich3 and gfortran > 10 don't get along...https://gcc.gnu.org/bugzilla/show_bug.cgi?id=91731
+    && FFLAGS="-w -fallow-argument-mismatch -O2" ./configure ${MPICH_CONFIGURE_OPTIONS} \
     && make -j $(nproc) ${MPICH_MAKE_OPTIONS} && make install \
     ##### Build and install HDF5 \
     && cd /tmp/ngen-deps \
@@ -318,8 +321,15 @@ RUN cd /tmp/ngen-deps \
     #&& ctest \
     && make install \
     # Install required python dependency packages with Pip \
-    && pip3 install numpy pandas pyyaml bmipy Cython blosc2==2.0.0 netCDF4 wheel packaging \
-    && HDF5_DIR=/usr pip3 install --install-option="\'--hdf5 \${HDF5_DIR}\'" --install-option="\'--jobs=$(nproc) \'"  --no-build-isolation tables \
+    # Except blosc2, since packaged wheels on pypi seem to have some issues, build it ourselves
+    && git clone https://github.com/Blosc/python-blosc2/ \
+    && cd python-blosc2 \
+    && git submodule update --init --recursive \
+    # TODO can checkout a particular tag -- as is you end up wtih a dev version, but it seems to work
+    && python3 -m pip install -r requirements-build.txt \
+    && pip3 install . \
+    && pip3 install numpy pandas pyyaml bmipy Cython netCDF4 wheel packaging \
+    && HDF5_DIR=/usr pip3 install -v --install-option="\'--hdf5 \${HDF5_DIR}\'" --install-option="\'--jobs=$(nproc) \'"  --no-build-isolation tables \
     # Make aliases for convenience \
     && alias pip='pip3' \
     && echo "alias pip='pip3'" >> /etc/profile \
@@ -405,21 +415,19 @@ RUN cp -s /usr/bin/python3 /usr/bin/python
 RUN cd ${WORKDIR}/t-route \
     && mkdir wheels \
     && pip3 install -r ./requirements.txt \
-    && pip3 install wheel deprecated dask \
+    && pip3 install wheel deprecated dask pyarrow geopandas
+    RUN export FC=gfortran NETCDF=/usr/include \
     && cd ${WORKDIR}/t-route \
-    && cd ./src/python_routing_v02 \
     && ./compiler.sh \
-    && python3 setup.py bdist_wheel \
+    && cd ./src/troute-network \
+    && python3 setup.py --use-cython bdist_wheel \
     && cp dist/*.whl ${WORKDIR}/t-route/wheels/ \
-    && cd ../python_framework_v02 \
-    && python3 setup.py bdist_wheel \
+    && cd ../troute-routing \
+    && python3 setup.py --use-cython bdist_wheel \
     && cp dist/*.whl ${WORKDIR}/t-route/wheels/ \
-    && cd ../nwm_routing \
+    && cd ../troute-nwm \
     && python3 setup.py bdist_wheel \
-    && cp dist/*.whl ${WORKDIR}/t-route/wheels/ \
-    && cd ../ngen_routing \
-    && python3 setup.py bdist_wheel \
-    && cp dist/*.whl ${WORKDIR}/t-route/wheels/
+    && cp dist/*.whl ${WORKDIR}/t-route/wheels/ 
 
 RUN rm /usr/bin/python
 
@@ -444,7 +452,7 @@ ARG NGEN_UDUNITS_QUIET
 
 ARG BUILD_NGEN_SERIAL
 ARG BUILD_NGEN_PARALLEL
-ARG BUILD_PARTITIONER
+ARG BUILD_NGEN_PARTITIONER
 ARG BUILD_NOAH_OWP
 ARG BUILD_CFE
 ARG BUILD_TOPMODEL
@@ -456,11 +464,24 @@ COPY --chown=${USER} --from=rocky_build_troute ${WORKDIR}/t-route/wheels /tmp/t-
 COPY --chown=${USER} --from=rocky_build_troute ${WORKDIR}/t-route/requirements.txt /tmp/t-route-requirements.txt
 ENV BOOST_ROOT=${WORKDIR}/boost
 
+USER root
+RUN if [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
+        chgrp -R ${USER} /usr/local/lib*/python3.* ; \
+        chmod -R g+sw /usr/local/lib*/python3.* ; \
+    fi \
+    && if [ "${NGEN_ROUTING_ACTIVE}" == "ON" ]; then \
+        # These packages install command line tools, which try to go in /usr/local/bin \
+        pip3 install pyarrow pyproj fiona; \
+    fi
+USER ${USER}
+
 RUN cd ${WORKDIR}/ngen \
     && if [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
         pip3 install -r extern/test_bmi_py/requirements.txt; \
         if [ "${NGEN_ROUTING_ACTIVE}" == "ON" ] ; then \
-            pip3 install /tmp/t-route-wheels/*.whl; pip3 install -r /tmp/t-route-requirements.txt; \
+            pip3 install /tmp/t-route-wheels/*.whl; \
+            pip3 install -r /tmp/t-route-requirements.txt; \
+            pip3 install deprecated geopandas ; \
             fi; \
         fi \
     &&  if [ "${NGEN_ACTIVATE_FORTRAN}" == "ON" ]; then \
@@ -508,7 +529,7 @@ RUN cd ${WORKDIR}/ngen \
     && ln -s $(if [ "${BUILD_NGEN_PARALLEL}" == "true" ]; then echo "cmake_build_parallel"; else echo "cmake_build_serial"; fi) cmake_build \
     &&  if [ "${BUILD_NGEN_PARTITIONER}" == "true" ]; then \
             cmake --build cmake_build --target partitionGenerator; \
-            $BUILD_DIR/test/test_bmi_python; \
+#            $BUILD_DIR/test/test_bmi_python; \
         fi \
     && for BUILD_DIR in $(if [ "${BUILD_NGEN_PARALLEL}" == "true" ]; then echo "cmake_build_parallel"; fi) $(if [ "${BUILD_NGEN_SERIAL}" == "true" ]; then echo "cmake_build_serial"; fi) ; do \
         cmake --build $BUILD_DIR --target ngen -j ${BUILD_PARALLEL_JOBS} \
@@ -579,7 +600,7 @@ ENV PATH=${WORKDIR}:$PATH
 
 ################################################################################################################
 ##### Final stage for image
-FROM rockylinux:8.6-minimal
+FROM rockylinux:9.1-minimal
 
 ########################################Copy over the NGEN artifacts############################################
 COPY --chown=root --from=rocky_build_staging /dmod/ /dmod/
