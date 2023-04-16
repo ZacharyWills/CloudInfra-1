@@ -475,6 +475,28 @@ RUN if [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
     fi
 USER ${USER}
 
+#These patches are from ngen commit 7551590a415b89026559c1c570d4154e4746161b
+#and are needed to fix an I/O bug in the sub modules (and bmi tests) that cause an infinite loop
+#the fix_tests patch cleans up some path handling to allow ctest to run automatically and detect
+#and run all tests (822 in serial, 828 in parallel -- some of which are duplicated)
+#Once these patches are applied upstream, this can be removed.
+COPY fix_tests_7551590a415b89026559c1c570d4154e4746161b.patch ${WORKDIR}/ngen/fix_tests.patch
+COPY fix_io_sub_7551590a415b89026559c1c570d4154e4746161b.patch ${WORKDIR}/ngen/fix_io_sub.patch
+# FIXME once these patches are all identified with issues/PR's upstream, drop some links in here
+# Apply the IO fix to submodules, once they all get patched/merged, this can be dropped...
+RUN cd ${WORKDIR}/ngen && git apply --reject --whitespace=fix \
+    # --exclude=extern/SoilFreezeThaw/forcing_code/src/bmi_aorc.c \
+    # --exclude=extern/SoilFreezeThaw/forcing_code/src/bmi_pet.c \
+    # --exclude=extern/cfe/forcing_code/src/bmi_aorc.c \
+    # --exclude=extern/cfe/forcing_code/src/bmi_pet.c \
+    # --exclude=extern/cfe/src/bmi_cfe.c \
+    # --exclude=extern/evapotranspiration/forcing_code/src/bmi_aorc.c \
+    # --exclude=extern/evapotranspiration/src/bmi_pet.c \
+    fix_io_sub.patch && \
+    #apply the patch to the main code
+    git apply --reject --whitespace=fix fix_tests.patch
+
+
 RUN cd ${WORKDIR}/ngen \
     && if [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
         pip3 install -r extern/test_bmi_py/requirements.txt; \
@@ -527,39 +549,31 @@ RUN cd ${WORKDIR}/ngen \
         -DNETCDF_CXX_LIBRARY=/usr/local/lib64/libnetcdf-cxx4.so ; \
     fi \
     && ln -s $(if [ "${BUILD_NGEN_PARALLEL}" == "true" ]; then echo "cmake_build_parallel"; else echo "cmake_build_serial"; fi) cmake_build \
-    &&  if [ "${BUILD_NGEN_PARTITIONER}" == "true" ]; then \
-            cmake --build cmake_build --target partitionGenerator; \
-#            $BUILD_DIR/test/test_bmi_python; \
+    # Build the required submodules/external libs needed for running the tests later \
+    # C++ functionality isn't separate, so always build the test_bmi_cpp shared lib (also needed for test_bmi_multi) \
+    && ./build_sub extern/test_bmi_cpp \
+    # For the external language BMI integrations, conditionally build the test packages/libraries and run tests \
+    &&  if [ "${NGEN_ACTIVATE_C}" == "ON" ]; then \
+            ./build_sub extern/test_bmi_c; \
+        fi \
+    &&  if [ "${NGEN_ACTIVATE_FORTRAN}" == "ON" ]; then \
+            ./build_sub extern/test_bmi_fortran; \
         fi \
     && for BUILD_DIR in $(if [ "${BUILD_NGEN_PARALLEL}" == "true" ]; then echo "cmake_build_parallel"; fi) $(if [ "${BUILD_NGEN_SERIAL}" == "true" ]; then echo "cmake_build_serial"; fi) ; do \
-        cmake --build $BUILD_DIR --target ngen -j ${BUILD_PARALLEL_JOBS} \
-        #Run the tests, if they fail, the image build fails \
-        && cmake --build $BUILD_DIR --target test_unit -j ${BUILD_PARALLEL_JOBS} \
-        && $BUILD_DIR/test/test_unit \
-        # C++ functionality isn't separate, so always build the test_bmi_cpp shared lib (also needed for test_bmi_multi) \
-        && ./build_sub extern/test_bmi_cpp \
-        && cmake --build $BUILD_DIR --target test_bmi_cpp \
-        && $BUILD_DIR/test/test_bmi_cpp \
-        # For the external language BMI integrations, conditionally build the test packages/libraries and run tests \
-        &&  if [ "${NGEN_ACTIVATE_C}" == "ON" ]; then \
-                ./build_sub extern/test_bmi_c; \
-                cmake --build $BUILD_DIR --target test_bmi_c; \
-                $BUILD_DIR/test/test_bmi_c; \
-            fi \
-        &&  if [ "${NGEN_ACTIVATE_FORTRAN}" == "ON" ]; then \
-                ./build_sub extern/test_bmi_fortran; \
-                cmake --build $BUILD_DIR --target test_bmi_fortran; \
-                $BUILD_DIR/test/test_bmi_fortran; \
-            fi \
-        &&  if [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
-                cmake --build $BUILD_DIR --target test_bmi_python; \
-                $BUILD_DIR/test/test_bmi_python; \
-            fi \
-        &&  if [ "${NGEN_ACTIVATE_C}" == "ON" ] && [ "${NGEN_ACTIVATE_FORTRAN}" == "ON" ] && [ "${NGEN_ACTIVATE_PYTHON}" == "ON" ]; then \
-                cmake --build $BUILD_DIR --target test_bmi_multi; \
-                $BUILD_DIR/test/test_bmi_multi; \
-            fi \
+        cmake --build $BUILD_DIR --target all -j ${BUILD_PARALLEL_JOBS}; \
     done \
+    # run the serial tests \
+    && cd ${WORKDIR}/ngen && cmake --build cmake_build_serial --target test \ 
+    # have to remove the output from the previous tests runs for routing test to be run again... \
+    && rm -f ./test/data/routing/*.parquet \
+    # run the parallel tests \
+    && cmake --build cmake_build_parallel --target test \
+    # clean these up again... \
+    && rm -f ./test/data/routing/*.parquet \
+    #Run the MPI tests manually, they don't play well with ctest and are skipped in the above tests \
+    && mpirun -n 2 cmake_build_parallel/test/test_remote_nexus \
+    && mpirun -n 3 cmake_build_parallel/test/test_remote_nexus \
+    && mpirun -n 4 cmake_build_parallel/test/test_remote_nexus \
     && find cmake_build* -type f -name "*" ! \( -name "*.so" -o -name "ngen" -o -name "partitionGenerator" \) -exec rm {} + 
 
 ################################################################################################################
